@@ -1,0 +1,92 @@
+# Builds Arrangeur MIDI (VST3 + VST2 + CLAP, LV2 on Linux) for Windows, macOS and Linux, runs the offline
+# music-logic tests, pluginval and a CLAP MIDI-output check (Linux), and publishes a GitHub Release on tags "v*".
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2022, name: windows-x64 }
+          - { os: macos-14,     name: macos-universal }
+          - { os: ubuntu-22.04, name: linux-x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxext-dev libxrandr-dev libxcursor-dev libgl1-mesa-dev libdbus-1-dev xvfb
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Music logic tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: CLAP MIDI output check
+        if: runner.os == 'Linux'
+        run: |
+          gcc -Idpf/distrho/src tools/clap_midi_check.c -o clap_midi_check -ldl -lm
+          ./clap_midi_check build/bin/arrangeur-midi.clap
+
+      - name: pluginval (strictness 10, VST3 + VST2)
+        if: runner.os == 'Linux'
+        run: |
+          curl -sL -o pluginval.zip https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Linux.zip
+          unzip -q pluginval.zip
+          xvfb-run -a ./pluginval --strictness-level 10 --validate-in-process --timeout-ms 600000 build/bin/arrangeur-midi.vst3
+          xvfb-run -a ./pluginval --strictness-level 10 --validate-in-process --timeout-ms 600000 build/bin/arrangeur-midi-vst2.so
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist/arrangeur-midi
+          ls build/bin
+          for f in build/bin/arrangeur-midi.vst3 build/bin/arrangeur-midi.clap build/bin/arrangeur-midi.lv2 build/bin/arrangeur-midi.vst build/bin/arrangeur-midi-vst2.*; do
+            if [ -e "$f" ]; then cp -R "$f" dist/arrangeur-midi/; fi
+          done
+          cp README.md LICENSE THIRD_PARTY.md dist/arrangeur-midi/
+          ls dist/arrangeur-midi
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then 7z a -tzip ../arrangeur-midi-${{ matrix.name }}.zip arrangeur-midi >/dev/null; else zip -qr ../arrangeur-midi-${{ matrix.name }}.zip arrangeur-midi; fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arrangeur-midi-${{ matrix.name }}
+          path: arrangeur-midi-${{ matrix.name }}.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/*.zip --repo "${GITHUB_REPOSITORY}" \
+            --title "Arrangeur MIDI ${GITHUB_REF_NAME}" \
+            --notes "Instrument VST3 / VST2 / CLAP (LV2 sous Linux) : accords, arpèges, strum et basse en une touche, sortie MIDI, export MIDI, synthé d'écoute. Windows x64 : copiez arrangeur-midi.vst3 dans C:\\Program Files\\Common Files\\VST3 (et arrangeur-midi-vst2.dll dans votre dossier VST2), puis Options > Manage plugins > Find installed plugins dans FL Studio. Voir le README pour le routage MIDI (ports / Patcher). Version 0.1 : non signée, pas encore testée dans FL Studio."
